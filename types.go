@@ -144,6 +144,14 @@ type ChannelState interface {
 	// Queued returns the number of bytes read from the node and queued for sending
 	Queued() uint64
 
+	// DataLimit returns the current limit for total data transferrable until a pause
+	// boolean == is a data limit present
+	DataLimit() (bool, uint64)
+
+	// AbleToCompleteTransfer determines whether the transfer will finish immediately
+	// or remained paused at the end in order to do final settlement
+	AbleToCompleteTransfer() bool
+
 	// Stages returns the timeline of events this data transfer has gone through,
 	// for observability purposes.
 	//

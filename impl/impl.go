@@ -300,6 +300,49 @@ func (m *manager) SendVoucher(ctx context.Context, channelID datatransfer.Channe
 	return m.channels.NewVoucher(channelID, voucher)
 }
 
+func (m *manager) SendVoucherResult(ctx context.Context, channelID datatransfer.ChannelID, voucherResult datatransfer.VoucherResult) error {
+	chst, err := m.channels.GetByID(ctx, channelID)
+	if err != nil {
+		return err
+	}
+	ctx, _ = m.spansIndex.SpanForChannel(ctx, channelID)
+	ctx, span := otel.Tracer("data-transfer").Start(ctx, "sendVoucherResult", trace.WithAttributes(
+		attribute.String("channelID", channelID.String()),
+		attribute.String("voucherResultType", string(voucherResult.Type())),
+	))
+	defer span.End()
+	if channelID.Initiator == m.peerID {
+		err := errors.New("cannot send voucher result for request we initiated")
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
+	}
+
+	var updateResponse datatransfer.Response
+	if chst.Status().InFinalization() {
+		updateResponse, err = message.CompleteResponse(channelID.ID, chst.Status().IsAccepted(), chst.Status().IsResponderPaused(), voucherResult.Type(), voucherResult)
+	} else {
+		updateResponse, err = message.VoucherResultResponse(channelID.ID, chst.Status().IsAccepted(), chst.Status().IsResponderPaused(), voucherResult.Type(), voucherResult)
+	}
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
+	}
+	if err := m.dataTransferNetwork.SendMessage(ctx, chst.OtherPeer(), updateResponse); err != nil {
+		err = fmt.Errorf("Unable to send request: %w", err)
+		_ = m.OnRequestDisconnected(channelID, err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
+	}
+	return m.channels.NewVoucherResult(channelID, voucherResult)
+}
+
+func (m *manager) SetDataLimit(ctx context.Context, chid datatransfer.ChannelID, totalData uint64, stopAtEnd bool) {
+
+}
+
 // close an open channel (effectively a cancel)
 func (m *manager) CloseDataTransferChannel(ctx context.Context, chid datatransfer.ChannelID) error {
 	log.Infof("close channel %s", chid)
