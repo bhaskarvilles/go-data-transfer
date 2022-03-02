@@ -83,7 +83,7 @@ func (m *manager) OnDataReceived(chid datatransfer.ChannelID, link ipld.Link, si
 		msg, err := m.processRevalidationResult(chid, result, err)
 		if msg != nil {
 			ctx, _ := m.spansIndex.SpanForChannel(context.TODO(), chid)
-			if err := m.dataTransferNetwork.SendMessage(ctx, chid.Initiator, msg); err != nil {
+			if err := m.transport.SendMessage(ctx, chid, msg); err != nil {
 				return err
 			}
 		}
@@ -97,7 +97,7 @@ func (m *manager) OnDataReceived(chid datatransfer.ChannelID, link ipld.Link, si
 // up some data to be sent to the requester.
 // It fires an event on the channel, updating the sum of queued data and calls
 // revalidators so they can pause / resume or send a message over the transport.
-func (m *manager) OnDataQueued(chid datatransfer.ChannelID, link ipld.Link, size uint64, index int64, unique bool) (datatransfer.Message, error) {
+func (m *manager) OnDataQueued(chid datatransfer.ChannelID, link ipld.Link, size uint64, index int64, unique bool) error {
 	// The transport layer reports that some data has been queued up to be sent
 	// to the requester, so fire a DataQueued event on the channels state
 	// machine.
@@ -112,18 +112,18 @@ func (m *manager) OnDataQueued(chid datatransfer.ChannelID, link ipld.Link, size
 
 	isNew, err := m.channels.DataQueued(chid, link.(cidlink.Link).Cid, size, index, unique)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	// If this block has already been queued on the channel, take no further
 	// action (this can happen when the data-transfer channel is restarted)
 	if !isNew {
-		return nil, nil
+		return nil
 	}
 
 	// If this node initiated the data transfer, there's nothing more to do
 	if chid.Initiator == m.peerID {
-		return nil, nil
+		return nil
 	}
 
 	// Check each revalidator to see if they want to pause / resume, or send
@@ -141,10 +141,17 @@ func (m *manager) OnDataQueued(chid datatransfer.ChannelID, link ipld.Link, size
 		return nil
 	})
 	if err != nil || result != nil {
-		return m.processRevalidationResult(chid, result, err)
+		msg, err := m.processRevalidationResult(chid, result, err)
+		if msg != nil {
+			ctx, _ := m.spansIndex.SpanForChannel(context.TODO(), chid)
+			if err := m.transport.SendMessage(ctx, chid, msg); err != nil {
+				return err
+			}
+		}
+		return err
 	}
 
-	return nil, nil
+	return nil
 }
 
 func (m *manager) OnDataSent(chid datatransfer.ChannelID, link ipld.Link, size uint64, index int64, unique bool) error {
@@ -278,15 +285,15 @@ func (m *manager) OnReceiveDataError(chid datatransfer.ChannelID, err error) err
 	return m.channels.ReceiveDataError(chid, err)
 }
 
-// OnChannelCompleted is called
+// OnTransferCompleted is called
 // - by the requester when all data for a transfer has been received
 // - by the responder when all data for a transfer has been sent
-func (m *manager) OnChannelCompleted(chid datatransfer.ChannelID, completeErr error) error {
+func (m *manager) OnTransferCompleted(chid datatransfer.ChannelID, completeErr error) error {
 	// If the channel completed successfully
 	if completeErr == nil {
 		// If the channel was initiated by the other peer
 		if chid.Initiator != m.peerID {
-			log.Infow("received OnChannelCompleted, will send completion message to initiator", "chid", chid)
+			log.Infow("received OnTransferCompleted, will send completion message to initiator", "chid", chid)
 			msg, err := m.completeMessage(chid)
 			if err != nil {
 				return err
@@ -295,7 +302,7 @@ func (m *manager) OnChannelCompleted(chid datatransfer.ChannelID, completeErr er
 				// Send the other peer a message that the transfer has completed
 				log.Infow("sending completion message to initiator", "chid", chid)
 				ctx, _ := m.spansIndex.SpanForChannel(context.Background(), chid)
-				if err := m.dataTransferNetwork.SendMessage(ctx, chid.Initiator, msg); err != nil {
+				if err := m.transport.SendMessage(ctx, chid, msg); err != nil {
 					err := xerrors.Errorf("channel %s: failed to send completion message to initiator: %w", chid, err)
 					log.Warnw("failed to send completion message to initiator", "chid", chid, "err", err)
 					return m.OnRequestDisconnected(chid, err)
@@ -396,7 +403,6 @@ func (m *manager) restartRequest(chid datatransfer.ChannelID,
 		transportConfigurer := processor.(datatransfer.TransportConfigurer)
 		transportConfigurer(chid, voucher, m.transport)
 	}
-	m.dataTransferNetwork.Protect(initiator, chid.String())
 	if voucherErr == datatransfer.ErrPause {
 		err := m.channels.PauseResponder(chid)
 		if err != nil {
@@ -429,7 +435,7 @@ func (m *manager) acceptRequest(chid datatransfer.ChannelID, incoming datatransf
 	}
 
 	log.Infow("data-transfer request validated, will create & start tracking channel", "channelID", chid, "payloadCid", incoming.BaseCid())
-	_, err = m.channels.CreateNew(m.peerID, incoming.TransferID(), incoming.BaseCid(), stor, voucher, chid.Initiator, dataSender, dataReceiver)
+	_, _, err = m.channels.CreateNew(m.peerID, incoming.TransferID(), incoming.BaseCid(), stor, voucher, chid.Initiator, dataSender, dataReceiver)
 	if err != nil {
 		log.Errorw("failed to create and start tracking channel", "channelID", chid, "err", err)
 		return result, err

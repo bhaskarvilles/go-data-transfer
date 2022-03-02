@@ -84,18 +84,8 @@ func checkConfig(cfg *Config) {
 	}
 }
 
-// AddPushChannel adds a push channel to the channel monitor
-func (m *Monitor) AddPushChannel(chid datatransfer.ChannelID) *monitoredChannel {
-	return m.addChannel(chid, true)
-}
-
-// AddPullChannel adds a pull channel to the channel monitor
-func (m *Monitor) AddPullChannel(chid datatransfer.ChannelID) *monitoredChannel {
-	return m.addChannel(chid, false)
-}
-
-// addChannel adds a channel to the channel monitor
-func (m *Monitor) addChannel(chid datatransfer.ChannelID, isPush bool) *monitoredChannel {
+// AddChannel adds a channel to the channel monitor
+func (m *Monitor) AddChannel(chid datatransfer.ChannelID, isPull bool) *monitoredChannel {
 	if !m.enabled() {
 		return nil
 	}
@@ -106,7 +96,7 @@ func (m *Monitor) addChannel(chid datatransfer.ChannelID, isPush bool) *monitore
 	// Check if there is already a monitor for this channel
 	if _, ok := m.channels[chid]; ok {
 		tp := "push"
-		if !isPush {
+		if isPull {
 			tp = "pull"
 		}
 		log.Warnf("ignoring add %s channel %s: %s channel with that id already exists",

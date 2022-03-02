@@ -11,7 +11,6 @@ import (
 	"github.com/ipfs/go-datastore"
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/ipld/go-ipld-prime"
-	cidlink "github.com/ipld/go-ipld-prime/linking/cid"
 	"github.com/libp2p/go-libp2p-core/peer"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -24,7 +23,6 @@ import (
 	"github.com/filecoin-project/go-data-transfer/channels"
 	"github.com/filecoin-project/go-data-transfer/encoding"
 	"github.com/filecoin-project/go-data-transfer/message"
-	"github.com/filecoin-project/go-data-transfer/network"
 	"github.com/filecoin-project/go-data-transfer/registry"
 	"github.com/filecoin-project/go-data-transfer/tracing"
 )
@@ -33,7 +31,6 @@ var log = logging.Logger("dt-impl")
 var cancelSendTimeout = 30 * time.Second
 
 type manager struct {
-	dataTransferNetwork  network.DataTransferNetwork
 	validatedTypes       *registry.Registry
 	resultTypes          *registry.Registry
 	revalidators         *registry.Registry
@@ -92,22 +89,21 @@ func ChannelRestartConfig(cfg channelmonitor.Config) DataTransferOption {
 }
 
 // NewDataTransfer initializes a new instance of a data transfer manager
-func NewDataTransfer(ds datastore.Batching, dataTransferNetwork network.DataTransferNetwork, transport datatransfer.Transport, options ...DataTransferOption) (datatransfer.Manager, error) {
+func NewDataTransfer(ds datastore.Batching, peerID peer.ID, transport datatransfer.Transport, options ...DataTransferOption) (datatransfer.Manager, error) {
 	m := &manager{
-		dataTransferNetwork:  dataTransferNetwork,
 		validatedTypes:       registry.NewRegistry(),
 		resultTypes:          registry.NewRegistry(),
 		revalidators:         registry.NewRegistry(),
 		transportConfigurers: registry.NewRegistry(),
 		pubSub:               pubsub.New(dispatcher),
 		readySub:             pubsub.New(readyDispatcher),
-		peerID:               dataTransferNetwork.ID(),
+		peerID:               peerID,
 		transport:            transport,
 		transferIDGen:        newTimeCounter(),
 		spansIndex:           tracing.NewSpansIndex(),
 	}
 
-	channels, err := channels.New(ds, m.notifier, m.voucherDecoder, m.resultTypes.Decoder, &channelEnvironment{m}, dataTransferNetwork.ID())
+	channels, err := channels.New(ds, m.notifier, m.voucherDecoder, m.resultTypes.Decoder, &channelEnvironment{m}, peerID)
 	if err != nil {
 		return nil, err
 	}
@@ -154,9 +150,6 @@ func (m *manager) Start(ctx context.Context) error {
 			log.Warnf("Publish data transfer ready event: %s", err.Error())
 		}
 	}()
-
-	dtReceiver := &receiver{m}
-	m.dataTransferNetwork.SetDelegate(dtReceiver)
 	return m.transport.SetEventHandler(m)
 }
 
@@ -170,7 +163,7 @@ func (m *manager) Stop(ctx context.Context) error {
 	log.Info("stop data-transfer module")
 	m.channelMonitor.Shutdown()
 	m.spansIndex.EndAll()
-	return m.transport.Shutdown(ctx)
+	return nil
 }
 
 // RegisterVoucherType registers a validator for the given voucher type
@@ -190,55 +183,32 @@ func (m *manager) RegisterVoucherType(voucherType datatransfer.Voucher, validato
 // transfer parts of the piece that match the selector
 func (m *manager) OpenPushDataChannel(ctx context.Context, requestTo peer.ID, voucher datatransfer.Voucher, baseCid cid.Cid, selector ipld.Node) (datatransfer.ChannelID, error) {
 	log.Infof("open push channel to %s with base cid %s", requestTo, baseCid)
-
-	req, err := m.newRequest(ctx, selector, false, voucher, baseCid, requestTo)
-	if err != nil {
-		return datatransfer.ChannelID{}, err
-	}
-
-	chid, err := m.channels.CreateNew(m.peerID, req.TransferID(), baseCid, selector, voucher,
-		m.peerID, m.peerID, requestTo) // initiator = us, sender = us, receiver = them
-	if err != nil {
-		return chid, err
-	}
-	ctx, span := m.spansIndex.SpanForChannel(ctx, chid)
-	processor, has := m.transportConfigurers.Processor(voucher.Type())
-	if has {
-		transportConfigurer := processor.(datatransfer.TransportConfigurer)
-		transportConfigurer(chid, voucher, m.transport)
-	}
-	m.dataTransferNetwork.Protect(requestTo, chid.String())
-	monitoredChan := m.channelMonitor.AddPushChannel(chid)
-	if err := m.dataTransferNetwork.SendMessage(ctx, requestTo, req); err != nil {
-		err = fmt.Errorf("Unable to send request: %w", err)
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-		_ = m.channels.Error(chid, err)
-
-		// If push channel monitoring is enabled, shutdown the monitor as it
-		// wasn't possible to start the data transfer
-		if monitoredChan != nil {
-			monitoredChan.Shutdown()
-		}
-
-		return chid, err
-	}
-
-	return chid, nil
+	return m.openChannel(ctx, requestTo, voucher, baseCid, selector, false)
 }
 
 // OpenPullDataChannel opens a data transfer that will request data from the sending peer and
 // transfer parts of the piece that match the selector
 func (m *manager) OpenPullDataChannel(ctx context.Context, requestTo peer.ID, voucher datatransfer.Voucher, baseCid cid.Cid, selector ipld.Node) (datatransfer.ChannelID, error) {
 	log.Infof("open pull channel to %s with base cid %s", requestTo, baseCid)
+	return m.openChannel(ctx, requestTo, voucher, baseCid, selector, true)
+}
 
-	req, err := m.newRequest(ctx, selector, true, voucher, baseCid, requestTo)
+func (m *manager) openChannel(ctx context.Context, requestTo peer.ID, voucher datatransfer.Voucher, baseCid cid.Cid, selector ipld.Node, isPull bool) (datatransfer.ChannelID, error) {
+
+	req, err := m.newRequest(ctx, selector, isPull, voucher, baseCid, requestTo)
 	if err != nil {
 		return datatransfer.ChannelID{}, err
 	}
+	sender := m.peerID
+	receiver := requestTo
+	if isPull {
+		sender = requestTo
+		receiver = m.peerID
+	}
+
 	// initiator = us, sender = them, receiver = us
-	chid, err := m.channels.CreateNew(m.peerID, req.TransferID(), baseCid, selector, voucher,
-		m.peerID, requestTo, m.peerID)
+	chid, channel, err := m.channels.CreateNew(m.peerID, req.TransferID(), baseCid, selector, voucher,
+		m.peerID, sender, receiver)
 	if err != nil {
 		return chid, err
 	}
@@ -248,9 +218,9 @@ func (m *manager) OpenPullDataChannel(ctx context.Context, requestTo peer.ID, vo
 		transportConfigurer := processor.(datatransfer.TransportConfigurer)
 		transportConfigurer(chid, voucher, m.transport)
 	}
-	m.dataTransferNetwork.Protect(requestTo, chid.String())
-	monitoredChan := m.channelMonitor.AddPullChannel(chid)
-	if err := m.transport.OpenChannel(ctx, requestTo, chid, cidlink.Link{Cid: baseCid}, selector, nil, req); err != nil {
+
+	monitoredChan := m.channelMonitor.AddChannel(chid, isPull)
+	if err := m.transport.OpenChannel(ctx, channel, req); err != nil {
 		err = fmt.Errorf("Unable to send request: %w", err)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
@@ -290,7 +260,7 @@ func (m *manager) SendVoucher(ctx context.Context, channelID datatransfer.Channe
 		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
-	if err := m.dataTransferNetwork.SendMessage(ctx, chst.OtherPeer(), updateRequest); err != nil {
+	if err := m.transport.SendMessage(ctx, channelID, updateRequest); err != nil {
 		err = fmt.Errorf("Unable to send request: %w", err)
 		_ = m.OnRequestDisconnected(channelID, err)
 		span.RecordError(err)
@@ -326,7 +296,7 @@ func (m *manager) CloseDataTransferChannel(ctx context.Context, chid datatransfe
 		sctx, cancel := context.WithTimeout(context.Background(), cancelSendTimeout)
 		defer cancel()
 		log.Infof("%s: sending cancel channel to %s for channel %s", m.peerID, chst.OtherPeer(), chid)
-		err = m.dataTransferNetwork.SendMessage(sctx, chst.OtherPeer(), m.cancelMessage(chid))
+		err = m.transport.SendMessage(sctx, chid, m.cancelMessage(chid))
 		if err != nil {
 			err = fmt.Errorf("unable to send cancel message for channel %s to peer %s: %w",
 				chid, m.peerID, err)
@@ -520,40 +490,10 @@ func (m *manager) RestartDataTransferChannel(ctx context.Context, chid datatrans
 	))
 	defer span.End()
 	// initiate restart
-	chType := m.channelDataTransferType(channel)
-	switch chType {
-	case ManagerPeerReceivePush:
-		return m.restartManagerPeerReceivePush(ctx, channel)
-	case ManagerPeerReceivePull:
-		return m.restartManagerPeerReceivePull(ctx, channel)
-	case ManagerPeerCreatePull:
-		return m.openPullRestartChannel(ctx, channel)
-	case ManagerPeerCreatePush:
-		return m.openPushRestartChannel(ctx, channel)
+	if channel.ChannelID().Initiator == m.peerID {
+		return m.openRestartChannel(ctx, channel)
 	}
-
-	return nil
-}
-
-func (m *manager) channelDataTransferType(channel datatransfer.ChannelState) ChannelDataTransferType {
-	initiator := channel.ChannelID().Initiator
-	if channel.IsPull() {
-		// we created a pull channel
-		if initiator == m.peerID {
-			return ManagerPeerCreatePull
-		}
-
-		// we received a pull channel
-		return ManagerPeerReceivePull
-	}
-
-	// we created a push channel
-	if initiator == m.peerID {
-		return ManagerPeerCreatePush
-	}
-
-	// we received a push channel
-	return ManagerPeerReceivePush
+	return m.restartManagerPeerReceive(ctx, channel)
 }
 
 func (m *manager) PeerID() peer.ID {

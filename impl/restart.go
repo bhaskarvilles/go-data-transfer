@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 
-	cidlink "github.com/ipld/go-ipld-prime/linking/cid"
 	"github.com/libp2p/go-libp2p-core/peer"
 	"golang.org/x/xerrors"
 
@@ -14,47 +13,20 @@ import (
 	"github.com/filecoin-project/go-data-transfer/message"
 )
 
-// ChannelDataTransferType identifies the type of a data transfer channel for the purposes of a restart
-type ChannelDataTransferType int
+func (m *manager) restartManagerPeerReceive(ctx context.Context, channel datatransfer.ChannelState) error {
+	restartable, ok := m.transport.(datatransfer.RestartableTransport)
+	if !ok {
+		return datatransfer.ErrUnsupported
+	}
 
-const (
-	// ManagerPeerCreatePull is the type of a channel wherein the manager peer created a Pull Data Transfer
-	ManagerPeerCreatePull ChannelDataTransferType = iota
-
-	// ManagerPeerCreatePush is the type of a channel wherein the manager peer created a Push Data Transfer
-	ManagerPeerCreatePush
-
-	// ManagerPeerReceivePull is the type of a channel wherein the manager peer received a Pull Data Transfer Request
-	ManagerPeerReceivePull
-
-	// ManagerPeerReceivePush is the type of a channel wherein the manager peer received a Push Data Transfer Request
-	ManagerPeerReceivePush
-)
-
-func (m *manager) restartManagerPeerReceivePush(ctx context.Context, channel datatransfer.ChannelState) error {
-	if err := m.validateRestartVoucher(channel, false); err != nil {
+	if err := m.validateRestartVoucher(channel, channel.IsPull()); err != nil {
 		return xerrors.Errorf("failed to restart channel, validation error: %w", err)
 	}
 
 	// send a libp2p message to the other peer asking to send a "restart push request"
 	req := message.RestartExistingChannelRequest(channel.ChannelID())
 
-	if err := m.dataTransferNetwork.SendMessage(ctx, channel.OtherPeer(), req); err != nil {
-		return xerrors.Errorf("unable to send restart request: %w", err)
-	}
-
-	return nil
-}
-
-func (m *manager) restartManagerPeerReceivePull(ctx context.Context, channel datatransfer.ChannelState) error {
-	if err := m.validateRestartVoucher(channel, true); err != nil {
-		return xerrors.Errorf("failed to restart channel, validation error: %w", err)
-	}
-
-	req := message.RestartExistingChannelRequest(channel.ChannelID())
-
-	// send a libp2p message to the other peer asking to send a "restart pull request"
-	if err := m.dataTransferNetwork.SendMessage(ctx, channel.OtherPeer(), req); err != nil {
+	if err := restartable.RestartChannel(ctx, channel, req); err != nil {
 		return xerrors.Errorf("unable to send restart request: %w", err)
 	}
 
@@ -80,14 +52,19 @@ func (m *manager) validateRestartVoucher(channel datatransfer.ChannelState, isPu
 	return nil
 }
 
-func (m *manager) openPushRestartChannel(ctx context.Context, channel datatransfer.ChannelState) error {
+func (m *manager) openRestartChannel(ctx context.Context, channel datatransfer.ChannelState) error {
 	selector := channel.Selector()
 	voucher := channel.Voucher()
 	baseCid := channel.BaseCID()
 	requestTo := channel.OtherPeer()
 	chid := channel.ChannelID()
 
-	req, err := message.NewRequest(chid.ID, true, false, voucher.Type(), voucher, baseCid, selector)
+	restartable, ok := m.transport.(datatransfer.RestartableTransport)
+	if !ok {
+		return datatransfer.ErrUnsupported
+	}
+
+	req, err := message.NewRequest(chid.ID, true, channel.IsPull(), voucher.Type(), voucher, baseCid, selector)
 	if err != nil {
 		return err
 	}
@@ -97,47 +74,11 @@ func (m *manager) openPushRestartChannel(ctx context.Context, channel datatransf
 		transportConfigurer := processor.(datatransfer.TransportConfigurer)
 		transportConfigurer(chid, voucher, m.transport)
 	}
-	m.dataTransferNetwork.Protect(requestTo, chid.String())
 
 	// Monitor the state of the connection for the channel
-	monitoredChan := m.channelMonitor.AddPushChannel(chid)
+	monitoredChan := m.channelMonitor.AddChannel(chid, channel.IsPull())
 	log.Infof("sending push restart channel to %s for channel %s", requestTo, chid)
-	if err := m.dataTransferNetwork.SendMessage(ctx, requestTo, req); err != nil {
-		// If push channel monitoring is enabled, shutdown the monitor as it
-		// wasn't possible to start the data transfer
-		if monitoredChan != nil {
-			monitoredChan.Shutdown()
-		}
-
-		return xerrors.Errorf("Unable to send restart request: %w", err)
-	}
-
-	return nil
-}
-
-func (m *manager) openPullRestartChannel(ctx context.Context, channel datatransfer.ChannelState) error {
-	selector := channel.Selector()
-	voucher := channel.Voucher()
-	baseCid := channel.BaseCID()
-	requestTo := channel.OtherPeer()
-	chid := channel.ChannelID()
-
-	req, err := message.NewRequest(chid.ID, true, true, voucher.Type(), voucher, baseCid, selector)
-	if err != nil {
-		return err
-	}
-
-	processor, has := m.transportConfigurers.Processor(voucher.Type())
-	if has {
-		transportConfigurer := processor.(datatransfer.TransportConfigurer)
-		transportConfigurer(chid, voucher, m.transport)
-	}
-	m.dataTransferNetwork.Protect(requestTo, chid.String())
-
-	// Monitor the state of the connection for the channel
-	monitoredChan := m.channelMonitor.AddPullChannel(chid)
-	log.Infof("sending open channel to %s to restart channel %s", requestTo, chid)
-	if err := m.transport.OpenChannel(ctx, requestTo, chid, cidlink.Link{Cid: baseCid}, selector, channel, req); err != nil {
+	if err := restartable.RestartChannel(ctx, channel, req); err != nil {
 		// If pull channel monitoring is enabled, shutdown the monitor as it
 		// wasn't possible to start the data transfer
 		if monitoredChan != nil {

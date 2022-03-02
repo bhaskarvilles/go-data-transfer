@@ -60,9 +60,9 @@ func TestChannelMonitorAutoRestart(t *testing.T) {
 
 				var mch *monitoredChannel
 				if isPush {
-					mch = m.AddPushChannel(ch1)
+					mch = m.AddChannel(ch1, false)
 				} else {
-					mch = m.AddPullChannel(ch1)
+					mch = m.AddChannel(ch1, true)
 				}
 
 				// Simulate the responder sending Accept
@@ -135,12 +135,12 @@ func TestChannelMonitorMaxConsecutiveRestarts(t *testing.T) {
 
 			var mch *monitoredChannel
 			if isPush {
-				mch = m.AddPushChannel(ch1)
+				mch = m.AddChannel(ch1, false)
 
 				mockAPI.dataQueued(10)
 				mockAPI.dataSent(5)
 			} else {
-				mch = m.AddPullChannel(ch1)
+				mch = m.AddChannel(ch1, true)
 
 				mockAPI.dataReceived(5)
 			}
@@ -217,12 +217,12 @@ func TestChannelMonitorQueuedRestart(t *testing.T) {
 			})
 
 			if isPush {
-				m.AddPushChannel(ch1)
+				m.AddChannel(ch1, false)
 
 				mockAPI.dataQueued(10)
 				mockAPI.dataSent(5)
 			} else {
-				m.AddPullChannel(ch1)
+				m.AddChannel(ch1, true)
 
 				mockAPI.dataReceived(5)
 			}
@@ -311,10 +311,10 @@ func TestChannelMonitorTimeouts(t *testing.T) {
 
 				var chCtx context.Context
 				if isPush {
-					mch := m.AddPushChannel(ch1)
+					mch := m.AddChannel(ch1, false)
 					chCtx = mch.ctx
 				} else {
-					mch := m.AddPullChannel(ch1)
+					mch := m.AddChannel(ch1, true)
 					chCtx = mch.ctx
 				}
 

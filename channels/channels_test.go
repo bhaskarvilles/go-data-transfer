@@ -10,7 +10,6 @@ import (
 	dss "github.com/ipfs/go-datastore/sync"
 	basicnode "github.com/ipld/go-ipld-prime/node/basic"
 	"github.com/ipld/go-ipld-prime/traversal/selector/builder"
-	peer "github.com/libp2p/go-libp2p-core/peer"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/xerrors"
 
@@ -405,17 +404,6 @@ func checkEvent(ctx context.Context, t *testing.T, received chan event, code dat
 }
 
 type fakeEnv struct {
-}
-
-func (fe *fakeEnv) Protect(id peer.ID, tag string) {
-}
-
-func (fe *fakeEnv) Unprotect(id peer.ID, tag string) bool {
-	return false
-}
-
-func (fe *fakeEnv) ID() peer.ID {
-	return peer.ID("")
 }
 
 func (fe *fakeEnv) CleanupChannel(chid datatransfer.ChannelID) {
